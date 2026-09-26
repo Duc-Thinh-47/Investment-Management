@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Mapping
 
 import pandas as pd
@@ -26,6 +27,62 @@ def _metadata_frame(metadata: Mapping[str, object]) -> pd.DataFrame:
 			"property": list(metadata),
 			"value": [str(value) for value in metadata.values()],
 		}
+	)
+
+
+def _excel_sheet_name(prefix: str, metric: str, used_names: set[str]) -> str:
+	"""Create a unique Excel-safe worksheet name."""
+	base_name = re.sub(r"[\\/*?:\[\]]", "_", f"{prefix} - {metric}")[:31]
+	if not base_name:
+		base_name = "Results"
+	name = base_name
+	suffix = 1
+	while name in used_names:
+		suffix_text = f"_{suffix}"
+		name = f"{base_name[:31 - len(suffix_text)]}{suffix_text}"
+		suffix += 1
+	used_names.add(name)
+	return name
+
+
+def _daily_metric_frame(
+	daily_returns: pd.DataFrame,
+	metric: str,
+) -> pd.DataFrame:
+	"""Pivot one daily result metric to dates by ticker."""
+	required_columns = {"date", "symbol", metric}
+	missing_columns = required_columns.difference(daily_returns.columns)
+	if missing_columns:
+		raise ValueError(
+			f"Daily returns are missing columns: {sorted(missing_columns)}"
+		)
+	if daily_returns.duplicated(["date", "symbol"]).any():
+		raise ValueError("Daily returns contain duplicate date/symbol observations.")
+
+	return (
+		daily_returns.pivot(index="date", columns="symbol", values=metric)
+		.reset_index()
+		.rename_axis(columns=None)
+	)
+
+
+def _annualized_metric_frame(
+	annualized_returns: pd.DataFrame,
+	metric: str,
+) -> pd.DataFrame:
+	"""Orient one annualized result metric horizontally by ticker."""
+	required_columns = {"symbol", metric}
+	missing_columns = required_columns.difference(annualized_returns.columns)
+	if missing_columns:
+		raise ValueError(
+			f"Annualized returns are missing columns: {sorted(missing_columns)}"
+		)
+	if annualized_returns["symbol"].duplicated().any():
+		raise ValueError("Annualized returns contain duplicate symbols.")
+
+	return pd.DataFrame(
+		[[metric, *annualized_returns[metric].tolist()]],
+		columns=["metric", *annualized_returns["symbol"].tolist()],
 	)
 
 
@@ -65,8 +122,28 @@ def write_returns_workbook(
 	"""
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 	with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-		daily_returns.to_excel(writer, sheet_name="Daily Log Returns", index=False)
-		annualized_returns.to_excel(writer, sheet_name="Annualized Returns", index=False)
+		used_names: set[str] = set()
+		daily_metrics = [
+			column for column in daily_returns.columns if column not in {"date", "symbol"}
+		]
+		annualized_metrics = [
+			column for column in annualized_returns.columns if column != "symbol"
+		]
+		if not daily_metrics and not annualized_metrics:
+			raise ValueError("No calculated result columns are available to write.")
+
+		for metric in daily_metrics:
+			_daily_metric_frame(daily_returns, metric).to_excel(
+				writer,
+				sheet_name=_excel_sheet_name("Daily", metric, used_names),
+				index=False,
+			)
+		for metric in annualized_metrics:
+			_annualized_metric_frame(annualized_returns, metric).to_excel(
+				writer,
+				sheet_name=_excel_sheet_name("Annualized", metric, used_names),
+				index=False,
+			)
 		_metadata_frame(metadata).to_excel(writer, sheet_name="Metadata", index=False)
 
 
